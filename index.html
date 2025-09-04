@@ -3,7 +3,7 @@
 <head>
   <meta charset="UTF-8" />
   <meta name="viewport" content="width=device-width, initial-scale=1" />
-  <title>6 m Cutting Plan (No Kerf) — Bin Packing</title>
+  <title>Cutting Plan — Custom Stock Length</title>
   <link rel="preconnect" href="https://fonts.googleapis.com">
   <link rel="preconnect" href="https://fonts.gstatic.com" crossorigin>
   <link href="https://fonts.googleapis.com/css2?family=Inter:wght@400;500;600;700&display=swap" rel="stylesheet">
@@ -30,18 +30,29 @@
       document.body.removeChild(link);
     }
 
+    // Parse CSV text into demand array
+    function parseCSV(text) {
+      const lines = text.trim().split(/\r?\n/);
+      const demand = [];
+      for (let i = 0; i < lines.length; i++) {
+        const [lenStr, qtyStr] = lines[i].split(',');
+        const len = parseInt(lenStr.trim(), 10);
+        const qty = parseInt(qtyStr.trim(), 10);
+        if (isFinite(len) && isFinite(qty) && len > 0 && qty > 0) {
+          demand.push({ lengthMM: len, qty });
+        }
+      }
+      return demand;
+    }
+
     // Core solver: repeated bounded knapsack using binary-split expansion
-    function planCuts(demand, stockLengthM = 6.0) {
-      const stockMM = Math.round(stockLengthM * 1000);
-
-      // Convert demand keys to mm integers
-      // demand: array of {lengthM: number, qty: number}
+    function planCuts(demand, stockLengthMM) {
       const items = demand
-        .filter(r => r.lengthM > 0 && r.qty > 0)
-        .map(r => ({ L: Math.round(r.lengthM * 1000), qty: Math.max(0, Math.floor(r.qty)) }))
-        .sort((a, b) => b.L - a.L); // sort desc by length (optional)
+        .filter(r => r.lengthMM > 0 && r.qty > 0)
+        .map(r => ({ L: r.lengthMM, qty: Math.max(0, Math.floor(r.qty)) }))
+        .sort((a, b) => b.L - a.L);
 
-      if (items.length === 0) return { bars: [], summary: { totalBars: 0, totalWasteM: 0 } };
+      if (items.length === 0) return { bars: [], summary: { totalBars: 0, totalWasteMM: 0 } };
 
       const remaining = new Map(items.map(it => [it.L, it.qty]));
       const bars = [];
@@ -52,9 +63,8 @@
       }
 
       function boundedKnapsack() {
-        // Binary-split bounded items to 0/1 chunks
-        const weights = []; // weight = length (mm)
-        const payload = []; // payload entry = {Ltrue, countInChunk}
+        const weights = [];
+        const payload = [];
 
         for (const { L, qty } of items) {
           let q = remaining.get(L) || 0;
@@ -69,7 +79,7 @@
         }
         if (!weights.length) return null;
 
-        const cap = stockMM;
+        const cap = stockLengthMM;
         const dp = new Int32Array(cap + 1).fill(-1);
         dp[0] = 0;
         const choice = new Int32Array(cap + 1).fill(-1);
@@ -87,13 +97,11 @@
           }
         }
 
-        // pick best capacity
         let bestC = 0;
         for (let c = 1; c <= cap; c++) if (dp[c] > dp[bestC]) bestC = c;
         if (dp[bestC] <= 0) return null;
 
-        // reconstruct
-        const cutCounts = new Map(); // Ltrue -> count
+        const cutCounts = new Map();
         let c = bestC;
         while (c > 0 && choice[c] !== -1) {
           const idx = choice[c];
@@ -103,45 +111,38 @@
           c -= w;
         }
         if (cutCounts.size === 0) return null;
-        return cutCounts; // Map
+        return cutCounts;
       }
 
       while (anyRemaining()) {
         let picks = boundedKnapsack();
         if (!picks) {
-          // Fallback: add one longest remaining piece
           let longest = -1;
           for (const [L, q] of remaining) if (q > 0) longest = Math.max(longest, L);
           if (longest === -1) break;
           picks = new Map([[longest, 1]]);
         }
 
-        // compute used and waste
         let used = 0;
         let pieces = [];
         for (const [L, cnt] of picks) {
           used += L * cnt;
           pieces.push({ L, cnt });
         }
-        if (used > stockMM) {
-          // very unlikely since knapsack respects capacity, but safe-guard
-          // shrink smallest pieces until fits
+        if (used > stockLengthMM) {
           pieces.sort((a, b) => a.L - b.L);
-          while (used > stockMM && pieces.length) {
+          while (used > stockLengthMM && pieces.length) {
             const p = pieces[0];
             p.cnt -= 1;
             used -= p.L;
             if (p.cnt <= 0) pieces.shift();
           }
-          // rebuild picks map
           picks = new Map();
           for (const p of pieces) picks.set(p.L, p.cnt);
         }
 
-        const waste = stockMM - used;
-        // record bar
+        const waste = stockLengthMM - used;
         bars.push({ picks: new Map(picks), waste });
-        // decrement remaining
         for (const [L, cnt] of picks) {
           remaining.set(L, Math.max(0, (remaining.get(L) || 0) - cnt));
         }
@@ -149,7 +150,7 @@
 
       const summary = {
         totalBars: bars.length,
-        totalWasteM: bars.reduce((acc, b) => acc + b.waste, 0) / 1000
+        totalWasteMM: bars.reduce((acc, b) => acc + b.waste, 0)
       };
       return { bars, summary };
     }
@@ -157,49 +158,47 @@
     function humanCuts(picks) {
       const arr = Array.from(picks.entries())
         .sort((a, b) => b[0] - a[0])
-        .map(([L, cnt]) => `${cnt}×${(L / 1000).toFixed(3)}m`);
+        .map(([L, cnt]) => `${cnt}×${L}mm`);
       return arr.join(' + ');
     }
 
     function runSolver() {
-      // Read table rows
       const tbody = document.querySelector('#demandBody');
       const rows = Array.from(tbody.querySelectorAll('tr'));
       const demand = [];
       for (const tr of rows) {
-        const len = parseFloat(tr.querySelector('.len').value);
+        const len = parseInt(tr.querySelector('.len').value, 10);
         const qty = parseInt(tr.querySelector('.qty').value, 10);
         if (!isFinite(len) || !isFinite(qty)) continue;
-        if (len > 0 && qty > 0) demand.push({ lengthM: len, qty });
+        if (len > 0 && qty > 0) demand.push({ lengthMM: len, qty });
       }
-      const { bars, summary } = planCuts(demand, 6.0);
+      const stockLengthMM = parseInt(document.querySelector('#stockLength').value, 10);
+      const { bars, summary } = planCuts(demand, stockLengthMM);
 
-      // Render results
       const out = document.querySelector('#resultsBody');
       out.innerHTML = '';
       bars.forEach((bar, i) => {
         const tr = document.createElement('tr');
-        const usedM = ( (6000 - bar.waste) / 1000 ).toFixed(3);
-        const wasteM = (bar.waste / 1000).toFixed(3);
+        const usedMM = ( (stockLengthMM - bar.waste) );
+        const wasteMM = bar.waste;
         tr.innerHTML = `
           <td class="cell">${i + 1}</td>
           <td class="cell">${humanCuts(bar.picks)}</td>
-          <td class="cell right">${usedM}</td>
-          <td class="cell right">${wasteM}</td>
+          <td class="cell right">${usedMM} mm</td>
+          <td class="cell right">${wasteMM} mm</td>
         `;
         out.appendChild(tr);
       });
 
       document.querySelector('#summaryBars').textContent = summary.totalBars;
-      document.querySelector('#summaryWaste').textContent = summary.totalWasteM.toFixed(3);
+      document.querySelector('#summaryWaste').textContent = summary.totalWasteMM + " mm";
 
-      // Enable CSV download
       document.querySelector('#btnCSV').onclick = () => {
-        const rows = [["Bar #","Cuts","Used (m)","Waste (m)"]];
+        const rows = [["Bar #","Cuts","Used (mm)","Waste (mm)"]];
         bars.forEach((bar, i) => {
-          const usedM = ((6000 - bar.waste)/1000).toFixed(3);
-          const wasteM = (bar.waste/1000).toFixed(3);
-          rows.push([i+1, humanCuts(bar.picks), usedM, wasteM]);
+          const usedMM = (stockLengthMM - bar.waste);
+          const wasteMM = bar.waste;
+          rows.push([i+1, humanCuts(bar.picks), usedMM, wasteMM]);
         });
         downloadCSV('cutting_plan.csv', rows);
       };
@@ -208,45 +207,47 @@
     function addRow(len = '', qty = '') {
       const tr = document.createElement('tr');
       tr.innerHTML = `
-        <td class="cell"><input class="len" type="number" step="0.001" min="0" value="${len}"></td>
+        <td class="cell"><input class="len" type="number" step="1" min="0" value="${len}"></td>
         <td class="cell"><input class="qty" type="number" step="1" min="0" value="${qty}"></td>
         <td class="cell"><button class="ghost" onclick="this.closest('tr').remove();">✕</button></td>
       `;
       document.querySelector('#demandBody').appendChild(tr);
     }
 
-    function loadExample() {
-      const demo = [
-        { lengthM: 0.5, qty: 20 },
-        { lengthM: 1.0, qty: 12 },
-        { lengthM: 1.7, qty: 34 },
-        { lengthM: 2.0, qty: 4 }
-      ];
-      const tbody = document.querySelector('#demandBody');
-      tbody.innerHTML = '';
-      demo.forEach(r => addRow(r.lengthM, r.qty));
+    function loadCSVFile(event) {
+      const file = event.target.files[0];
+      if (!file) return;
+      const reader = new FileReader();
+      reader.onload = (e) => {
+        const text = e.target.result;
+        const demand = parseCSV(text);
+        const tbody = document.querySelector('#demandBody');
+        tbody.innerHTML = '';
+        demand.forEach(r => addRow(r.lengthMM, r.qty));
+      };
+      reader.readAsText(file);
     }
 
     window.addEventListener('DOMContentLoaded', () => {
-      loadExample();
       document.querySelector('#btnAdd').addEventListener('click', () => addRow());
       document.querySelector('#btnSolve').addEventListener('click', runSolver);
       document.querySelector('#btnCSV').addEventListener('click', () => {});
       document.querySelector('#btnClear').addEventListener('click', () => {
         document.querySelector('#resultsBody').innerHTML = '';
         document.querySelector('#summaryBars').textContent = '0';
-        document.querySelector('#summaryWaste').textContent = '0.000';
+        document.querySelector('#summaryWaste').textContent = '0 mm';
       });
+      document.querySelector('#fileInput').addEventListener('change', loadCSVFile);
     });
   </script>
   <style>
-    :root { --bg: #0b0f19; --panel: #121829; --ink: #e5e7eb; --muted: #9aa4b2; --accent: #60a5fa; }
+    :root { --bg: #0b0f19; --panel: #121829; --ink: #e5e7eb; --muted: #9aa4b2; }
     * { box-sizing: border-box; }
     html, body { margin: 0; padding: 0; font-family: Inter, system-ui, -apple-system, Segoe UI, Roboto, sans-serif; background: var(--bg); color: var(--ink); }
     .container { max-width: 1100px; margin: 40px auto; padding: 0 16px; }
     .card { background: linear-gradient(180deg, rgba(255,255,255,0.02), rgba(255,255,255,0.01)); border: 1px solid rgba(255,255,255,0.08); border-radius: 18px; box-shadow: 0 10px 30px rgba(0,0,0,0.25); }
     header { display: flex; justify-content: space-between; align-items: center; margin-bottom: 16px; }
-    h1 { font-size: 24px; margin: 0; letter-spacing: 0.2px; }
+    h1 { font-size: 24px; margin: 0; }
     p.sub { color: var(--muted); margin: 6px 0 0; font-size: 14px; }
     .grid { display: grid; grid-template-columns: 1fr 1fr; gap: 16px; }
     @media (max-width: 900px) { .grid { grid-template-columns: 1fr; } }
@@ -261,11 +262,11 @@
     td.cell.right { text-align: right; }
 
     input[type="number"] { width: 100%; padding: 8px 10px; border-radius: 10px; border: 1px solid rgba(255,255,255,0.14); background: #0f1523; color: var(--ink); }
+    input[type="file"] { color: var(--ink); }
 
-    .toolbar { display: flex; gap: 8px; margin: 8px 0 12px; }
+    .toolbar { display: flex; gap: 8px; margin: 8px 0 12px; flex-wrap: wrap; }
     button { padding: 10px 14px; border-radius: 12px; border: 1px solid rgba(255,255,255,0.12); background: #1a2440; color: var(--ink); cursor: pointer; font-weight: 600; }
     button:hover { border-color: rgba(255,255,255,0.25); }
-    button.accent { background: #1b284a; border-color: #2a4b8c; color: #e8f1ff; }
     button.ghost { background: transparent; border: 1px solid rgba(255,255,255,0.14); padding: 6px 10px; }
 
     .summary { display: flex; gap: 24px; align-items: baseline; margin-top: 8px; color: var(--muted); }
@@ -277,12 +278,12 @@
   <div class="container">
     <header>
       <div>
-        <h1>6 m Cutting Plan (No Kerf)</h1>
-        <p class="sub">Heuristic solver using bounded knapsack — combine any lengths per bar as long as they fit within 6.0 m.</p>
+        <h1>Cutting Plan</h1>
+        <p class="sub">Heuristic solver with customizable stock length. Units: millimeters only.</p>
       </div>
       <div class="summary">
         <span>Total Bars:<strong id="summaryBars">0</strong></span>
-        <span>Total Waste (m):<strong id="summaryWaste">0.000</strong></span>
+        <span>Total Waste:<strong id="summaryWaste">0 mm</strong></span>
       </div>
     </header>
 
@@ -291,21 +292,26 @@
         <h2>Demand</h2>
         <div class="toolbar">
           <button id="btnAdd">+ Add row</button>
-          <button id="btnSolve" class="accent">Solve</button>
+          <button id="btnSolve">Solve</button>
           <button id="btnCSV">Download CSV</button>
           <button id="btnClear">Clear Results</button>
+          <input type="file" id="fileInput" accept=".csv,.txt,.xls,.xlsx" />
+        </div>
+        <div class="toolbar">
+          <label for="stockLength">Stock length (mm): </label>
+          <input type="number" id="stockLength" value="6000" min="100" step="10" />
         </div>
         <table>
           <thead>
             <tr>
-              <th>Length (m)</th>
+              <th>Length (mm)</th>
               <th>Quantity</th>
               <th></th>
             </tr>
           </thead>
           <tbody id="demandBody"></tbody>
         </table>
-        <footer class="note">Tip: Use decimals (e.g., 0.5 for 50 cm). Kerf/trim are ignored by design.</footer>
+        <footer class="note">Tip: Input length in millimeters. You can also upload a CSV file with columns: length,quantity.</footer>
       </section>
 
       <section class="card panel">
@@ -315,13 +321,12 @@
             <tr>
               <th>Bar #</th>
               <th>Cuts</th>
-              <th class="right">Used (m)</th>
-              <th class="right">Waste (m)</th>
+              <th class="right">Used</th>
+              <th class="right">Waste</th>
             </tr>
           </thead>
           <tbody id="resultsBody"></tbody>
         </table>
-        <footer class="note">Each row is one 6 m stock bar. “Cuts” shows piece counts and lengths packed by the solver.</footer>
       </section>
     </div>
   </div>
